@@ -10,14 +10,18 @@ namespace EscapeRoomML
 {
     /// <summary>
     /// Unity 6 + ML-Agents 4.1 3D Cube Escape Agent (1x1x1 BoxCollider)
-    /// using Discrete Actions (Move, Strafe, Rotate, Jump) and Ray + Vector Observations (Space Size = 14).
+    /// Includes:
+    /// - Downward Cliff/Pit & Low-Hazard Raycast Probes (so the agent can see floor gaps & lasers to jump over)
+    /// - High-Water-Mark Horizontal Progress Reward (prevents running in circles at spawn)
+    /// - Contextual Jump Shaping (rewards jumping forward when a pit or hazard is ahead)
+    /// Vector Observation Space Size remains 14.
     /// </summary>
     [RequireComponent(typeof(Rigidbody), typeof(BoxCollider))]
     public class EscapeAgent : Agent
     {
         [Header("Arena Reference")]
         public EscapeArenaManager arenaManager;
-        
+
         [Header("Movement & Jump Settings")]
         [Tooltip("Forward/backward and strafe movement speed (m/s).")]
         public float moveSpeed = 6.0f;
@@ -31,19 +35,25 @@ namespace EscapeRoomML
         [Tooltip("Extra gravity multiplier while falling for snappy platforming over lasers.")]
         public float fallGravityMultiplier = 2.0f;
 
-        [Header("Cube Ground Check (Centered on 1x1x1 Cube)")]
+        [Header("Cube Ground & Pit Check (Centered on 1x1x1 Cube)")]
         [Tooltip("Half-extents of the ground check box cast below the cube center.")]
         public Vector3 groundBoxHalfExtents = new Vector3(0.42f, 0.08f, 0.42f);
         [Tooltip("Cast distance downward from the center of the 1x1x1 cube.")]
         public float groundCastDistance = 0.52f;
         public LayerMask groundLayerMask = ~0;
 
-        [Header("Reward Shaping")]
-        [Tooltip("Small per-step time penalty to encourage escaping as fast as possible.")]
+        [Header("Reward Shaping (Anti-Looping & Jump Discovery)")]
+        [Tooltip("Small per-step time penalty to encourage escaping quickly.")]
         public float stepTimePenalty = -0.0005f;
 
-        [Tooltip("Dense shaping reward multiplier for closing the distance to the active room objective.")]
-        public float approachObjectiveRewardScale = 0.015f;
+        [Tooltip("Reward per meter of NEW closest horizontal progress toward the active objective (cannot be farmed in circles).")]
+        public float progressRewardPerMeter = 0.15f;
+
+        [Tooltip("Small bonus when jumping forward across a detected pit edge or low hazard.")]
+        public float smartJumpBonus = 0.06f;
+
+        [Tooltip("Tiny penalty for jumping when no pit, hazard, or elevated target is nearby.")]
+        public float unnecessaryJumpPenalty = -0.008f;
 
         [Tooltip("Y-threshold below the room floor that counts as falling into a pit.")]
         public float pitFallYOffset = -1.8f;
@@ -54,9 +64,15 @@ namespace EscapeRoomML
 
         private Rigidbody _rb;
         private BoxCollider _boxCollider;
-        private float _previousDistanceToObjective;
+        private float _closestHorizontalDistToObjective;
+        private Vector3 _lastTrackedObjectivePos;
         private float _jumpCooldownTimer;
         private bool _isFrozenForVictory;
+
+        // Forward pit/hazard perception cache updated every FixedUpdate
+        private bool _isPitAheadNear;
+        private bool _isPitAheadFar;
+        private bool _isLowHazardAhead;
 
         public override void Initialize()
         {
@@ -101,18 +117,36 @@ namespace EscapeRoomML
             if (arenaManager != null)
             {
                 arenaManager.BeginRoomEpisode();
-
-                var room = arenaManager.CurrentRoom;
-                if (room != null)
-                {
-                    _previousDistanceToObjective = Vector3.Distance(
-                        transform.position,
-                        room.GetCurrentObjectiveWorldPosition()
-                    );
-                }
+                ResetObjectiveProgressTracker();
             }
         }
 
+        /// <summary>
+        /// Resets the high-water-mark distance tracker whenever a room starts or a sub-puzzle is solved.
+        /// </summary>
+        public void ResetObjectiveProgressTracker()
+        {
+            if (arenaManager != null && arenaManager.CurrentRoom != null)
+            {
+                _lastTrackedObjectivePos = arenaManager.CurrentRoom.GetCurrentObjectiveWorldPosition();
+                _closestHorizontalDistToObjective = HorizontalDistance(transform.position, _lastTrackedObjectivePos);
+            }
+        }
+
+        /// <summary>
+        /// Collects 14 Vector Observations:
+        /// [0]     Normalized Remaining Room Time (0..1)
+        /// [1]     Normalized Current Room Index (0..1)
+        /// [2]     Is Grounded (0 or 1)
+        /// [3]     Is Current Room Door Unlocked (0 or 1)
+        /// [4..6]  Agent Local Velocity Normalized (x, y, z)
+        /// [7..9]  Relative Vector to Current Active Objective in Local Space (x, y, z)
+        /// [10]    Pit / Floor Gap Detected 1.1m Ahead (0 or 1)
+        /// [11]    Pit / Floor Gap Detected 2.2m Ahead (0 or 1)
+        /// [12]    Low Jumpable Hazard Detected Ahead (0 or 1)
+        /// [13]    Current Room Puzzle Completion Progress (0..1)
+        /// Total Vector Observation Space Size = 14.
+        /// </summary>
         public override void CollectObservations(VectorSensor sensor)
         {
             if (arenaManager == null || arenaManager.CurrentRoom == null)
@@ -123,6 +157,7 @@ namespace EscapeRoomML
             }
 
             EscapeRoomController room = arenaManager.CurrentRoom;
+            UpdateGroundedAndForwardProbes();
 
             // 1. Normalized remaining room time (1 float)
             float normTime = arenaManager.CurrentRoomTimeLimit > 0f
@@ -147,15 +182,13 @@ namespace EscapeRoomML
 
             // 6. Relative vector to current active objective (3 floats)
             Vector3 objectiveWorldPos = room.GetCurrentObjectiveWorldPosition();
-            Vector3 toObjectiveLocal = transform.InverseTransformPoint(objectiveWorldPos) / 20f;
+            Vector3 toObjectiveLocal = transform.InverseTransformPoint(objectiveWorldPos) / 16f;
             sensor.AddObservation(Vector3.ClampMagnitude(toObjectiveLocal, 1.5f));
 
-            // 7. Relative vector to room exit door (3 floats)
-            Vector3 doorWorldPos = room.exitDoorTransform != null
-                ? room.exitDoorTransform.position
-                : objectiveWorldPos;
-            Vector3 toDoorLocal = transform.InverseTransformPoint(doorWorldPos) / 20f;
-            sensor.AddObservation(Vector3.ClampMagnitude(toDoorLocal, 1.5f));
+            // 7. Forward Pit & Jumpable Hazard Probes (3 floats — lets the agent "see" pits in the floor!)
+            sensor.AddObservation(_isPitAheadNear ? 1f : 0f);
+            sensor.AddObservation(_isPitAheadFar ? 1f : 0f);
+            sensor.AddObservation(_isLowHazardAhead ? 1f : 0f);
 
             // 8. Room puzzle completion fraction (1 float)
             sensor.AddObservation(room.GetPuzzleProgress());
@@ -166,7 +199,7 @@ namespace EscapeRoomML
             if (_isFrozenForVictory || arenaManager == null || arenaManager.HasHeroCompletedAllRooms)
                 return;
 
-            UpdateGroundedState();
+            UpdateGroundedAndForwardProbes();
             if (_jumpCooldownTimer > 0f)
                 _jumpCooldownTimer -= Time.fixedDeltaTime;
 
@@ -207,12 +240,25 @@ namespace EscapeRoomML
                 desiredHorizontalDir.z * moveSpeed
             );
 
-            // 3. Jump Action
+            // 3. Jump Action + Contextual Jump Shaping
             if (jumpAction == 1 && IsGrounded && _jumpCooldownTimer <= 0f)
             {
                 targetVel.y = jumpVelocity;
                 IsGrounded = false;
-                _jumpCooldownTimer = 0.25f;
+                _jumpCooldownTimer = 0.35f;
+
+                EscapeRoomController currentRoom = arenaManager.CurrentRoom;
+                bool objectiveIsElevated = currentRoom != null &&
+                    (currentRoom.GetCurrentObjectiveWorldPosition().y > transform.position.y + 0.15f);
+
+                if ((_isPitAheadNear || _isPitAheadFar || _isLowHazardAhead || objectiveIsElevated) && moveAction == 1)
+                {
+                    AddReward(smartJumpBonus);
+                }
+                else
+                {
+                    AddReward(unnecessaryJumpPenalty);
+                }
             }
 
             if (!IsGrounded && targetVel.y < 0f)
@@ -222,21 +268,35 @@ namespace EscapeRoomML
 
             SetLinearVelocity(targetVel);
 
-            // 4. Per-step rewards & pit check
+            // 4. Per-step time penalty
             AddReward(stepTimePenalty);
 
+            // 5. High-Water-Mark Horizontal Progress Reward (cannot be farmed by running in circles!)
             EscapeRoomController room = arenaManager.CurrentRoom;
             if (room != null)
             {
                 Vector3 objectivePos = room.GetCurrentObjectiveWorldPosition();
-                float currentDist = Vector3.Distance(transform.position, objectivePos);
-                float distDelta = _previousDistanceToObjective - currentDist;
-                AddReward(Mathf.Clamp(distDelta * approachObjectiveRewardScale, -0.01f, 0.015f));
-                _previousDistanceToObjective = currentDist;
 
+                // If the room's active objective switched (e.g., picked up Key -> now targeting Exit Door),
+                // reset the high-water-mark baseline to the new target.
+                if (Vector3.SqrMagnitude(objectivePos - _lastTrackedObjectivePos) > 1.0f)
+                {
+                    _lastTrackedObjectivePos = objectivePos;
+                    _closestHorizontalDistToObjective = HorizontalDistance(transform.position, objectivePos);
+                }
+
+                float currentHorizDist = HorizontalDistance(transform.position, objectivePos);
+                if (currentHorizDist < _closestHorizontalDistToObjective)
+                {
+                    float newProgress = _closestHorizontalDistToObjective - currentHorizDist;
+                    AddReward(newProgress * progressRewardPerMeter);
+                    _closestHorizontalDistToObjective = currentHorizDist;
+                }
+
+                // Check if the agent fell into a pit
                 if (transform.position.y < room.transform.position.y + pitFallYOffset)
                 {
-                    arenaManager.OnAgentFailed("Fell in Pit");
+                    arenaManager.OnAgentFailed("Fell in Pit", isTimeout: false);
                 }
             }
 
@@ -295,7 +355,7 @@ namespace EscapeRoomML
         public void OnHitHazard(string hazardName)
         {
             if (arenaManager != null && !_isFrozenForVictory)
-                arenaManager.OnAgentFailed($"Hit {hazardName}");
+                arenaManager.OnAgentFailed($"Hit {hazardName}", isTimeout: false);
         }
 
         public void OnReachedRoomExitTrigger()
@@ -314,7 +374,7 @@ namespace EscapeRoomML
             transform.SetPositionAndRotation(position, rotation);
             _rb.position = position;
             _rb.rotation = rotation;
-            UpdateGroundedState();
+            UpdateGroundedAndForwardProbes();
         }
 
         public void FreezeAgentOnVictory()
@@ -328,7 +388,7 @@ namespace EscapeRoomML
             }
         }
 
-        private void UpdateGroundedState()
+        private void UpdateGroundedAndForwardProbes()
         {
             IsGrounded = Physics.BoxCast(
                 transform.position,
@@ -340,6 +400,50 @@ namespace EscapeRoomML
                 groundLayerMask,
                 QueryTriggerInteraction.Ignore
             );
+
+            // Probe 1.1m and 2.2m ahead downward to detect floor gaps (pits)
+            Vector3 nearProbeOrigin = transform.position + transform.forward * 1.1f;
+            Vector3 farProbeOrigin = transform.position + transform.forward * 2.2f;
+
+            _isPitAheadNear = !Physics.Raycast(
+                nearProbeOrigin,
+                Vector3.down,
+                1.3f,
+                groundLayerMask,
+                QueryTriggerInteraction.Ignore
+            );
+
+            _isPitAheadFar = !Physics.Raycast(
+                farProbeOrigin,
+                Vector3.down,
+                1.3f,
+                groundLayerMask,
+                QueryTriggerInteraction.Ignore
+            );
+
+            // Probe forward at ankle/waist height to detect jumpable hazards/lasers
+            _isLowHazardAhead = false;
+            if (Physics.SphereCast(
+                transform.position + Vector3.down * 0.1f,
+                0.35f,
+                transform.forward,
+                out RaycastHit hit,
+                2.5f,
+                ~0,
+                QueryTriggerInteraction.Collide))
+            {
+                if (hit.collider.CompareTag("Hazard"))
+                {
+                    _isLowHazardAhead = true;
+                }
+            }
+        }
+
+        private static float HorizontalDistance(Vector3 a, Vector3 b)
+        {
+            float dx = a.x - b.x;
+            float dz = a.z - b.z;
+            return Mathf.Sqrt(dx * dx + dz * dz);
         }
 
         private Vector3 GetLinearVelocity()

@@ -6,6 +6,7 @@ namespace EscapeRoomML
     /// <summary>
     /// Controls a single room's puzzle elements, moving hazards, exit door, and spawn points.
     /// Attach this to the root GameObject of each room (e.g., Room_1, Room_2, Room_3).
+    /// Automatically finds child SpawnPoint and CameraAnchor transforms if left unassigned in the Inspector.
     /// </summary>
     public class EscapeRoomController : MonoBehaviour
     {
@@ -16,11 +17,11 @@ namespace EscapeRoomML
         [Tooltip("Maximum time in seconds allowed to escape this room before respawning.")]
         public float roomTimeLimit = 30f;
 
-        [Header("Spawning")]
+        [Header("Spawning & Camera Framing")]
         [Tooltip("Where the agent spawns when starting or retrying this room.")]
         public Transform agentSpawnPoint;
 
-        [Tooltip("Optional camera anchor transform for framing this room when the Hero Agent is inside.")]
+        [Tooltip("Transform (or disabled Camera) inside this room that defines the exact position & rotation for filming this room.")]
         public Transform cameraAnchor;
 
         [Tooltip("Enable small position jitter on spawn to prevent deterministic local loops.")]
@@ -64,10 +65,44 @@ namespace EscapeRoomML
         {
             _propBlock = new MaterialPropertyBlock();
 
+            // Auto-find SpawnPoint if not wired in the Inspector
+            if (agentSpawnPoint == null)
+            {
+                Transform foundSpawn = transform.Find("SpawnPoint");
+                if (foundSpawn != null)
+                    agentSpawnPoint = foundSpawn;
+            }
+
+            // Auto-find CameraAnchor (or a child Camera placed in the room for framing) if not wired in the Inspector
+            if (cameraAnchor == null)
+            {
+                Transform foundCam = transform.Find("CameraAnchor");
+                if (foundCam == null)
+                {
+                    Camera childCam = GetComponentInChildren<Camera>(true);
+                    if (childCam != null)
+                        foundCam = childCam.transform;
+                }
+                if (foundCam != null)
+                    cameraAnchor = foundCam;
+            }
+
+            // If the user placed a Camera component on the room's cameraAnchor to preview the angle,
+            // disable that Camera component at runtime so it doesn't fight with Main Camera.
+            if (cameraAnchor != null && cameraAnchor.TryGetComponent<Camera>(out Camera anchorCam))
+            {
+                anchorCam.enabled = false;
+                if (cameraAnchor.TryGetComponent<AudioListener>(out AudioListener listener))
+                    listener.enabled = false;
+            }
+
             if (exitDoorTransform != null)
             {
                 _doorClosedLocalPos = exitDoorTransform.localPosition;
                 _doorTargetLocalPos = _doorClosedLocalPos;
+
+                if (doorStatusRenderer == null)
+                    doorStatusRenderer = exitDoorTransform.GetComponent<Renderer>();
             }
 
             // Register this room controller with all child puzzle & hazard elements
@@ -209,7 +244,7 @@ namespace EscapeRoomML
         {
             if (agentSpawnPoint == null)
             {
-                position = transform.position + Vector3.up * 0.5f;
+                position = transform.position + Vector3.up * 0.55f;
                 rotation = transform.rotation;
                 return;
             }
@@ -232,8 +267,8 @@ namespace EscapeRoomML
 
             doorStatusRenderer.GetPropertyBlock(_propBlock);
             Color targetColor = unlocked ? unlockedColor : lockedColor;
-            _propBlock.SetColor("_BaseColor", targetColor); // URP Lit shader property
-            _propBlock.SetColor("_Color", targetColor);     // Built-in Standard shader fallback
+            _propBlock.SetColor("_BaseColor", targetColor);
+            _propBlock.SetColor("_Color", targetColor);
             doorStatusRenderer.SetPropertyBlock(_propBlock);
         }
     }

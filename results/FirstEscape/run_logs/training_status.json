@@ -2,22 +2,22 @@
     "EscapeAgent": {
         "checkpoints": [
             {
-                "steps": 134669,
-                "file_path": "results\\FirstEscape\\EscapeAgent\\EscapeAgent-134669.onnx",
-                "reward": -1.5479554384946823,
-                "creation_time": 1794228399.5001044,
+                "steps": 439050,
+                "file_path": "results\\FirstEscape\\EscapeAgent\\EscapeAgent-439050.onnx",
+                "reward": 5.352671095593409,
+                "creation_time": 1794233327.1327572,
                 "auxillary_file_paths": [
-                    "results\\FirstEscape\\EscapeAgent\\EscapeAgent-134669.pt"
+                    "results\\FirstEscape\\EscapeAgent\\EscapeAgent-439050.pt"
                 ]
             }
         ],
         "final_checkpoint": {
-            "steps": 134669,
+            "steps": 439050,
             "file_path": "results\\FirstEscape\\EscapeAgent.onnx",
-            "reward": -1.5479554384946823,
-            "creation_time": 1794228399.5001044,
+            "reward": 5.352671095593409,
+            "creation_time": 1794233327.1327572,
             "auxillary_file_paths": [
-                "results\\FirstEscape\\EscapeAgent\\EscapeAgent-134669.pt"
+                "results\\FirstEscape\\EscapeAgent\\EscapeAgent-439050.pt"
             ]
         }
     },

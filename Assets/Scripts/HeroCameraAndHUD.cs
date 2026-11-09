@@ -3,34 +3,46 @@ using UnityEngine;
 namespace EscapeRoomML
 {
     /// <summary>
-    /// Smoothly pans the Main Camera to follow the Hero Arena's active room and draws a clean,
-    /// YouTube-ready On-Screen HUD showing Room Progress, Timer Countdown, Attempts, and Victory Banner.
-    /// Attach this to your Main Camera.
+    /// Smoothly moves the Main Camera to match the Hero Arena's active room CameraAnchor (position & rotation)
+    /// and draws the YouTube On-Screen HUD.
+    /// Works whether attached directly to Main Camera OR to EscapeArena / any manager object in the scene.
     /// </summary>
     public class HeroCameraAndHUD : MonoBehaviour
     {
-        [Header("Hero Arena Reference")]
-        [Tooltip("Assign your designated Hero EscapeArenaManager here.")]
+        [Header("Hero Arena & Camera References")]
+        [Tooltip("Assign your designated Hero EscapeArenaManager here (auto-detected if left empty).")]
         public EscapeArenaManager heroArena;
 
-        [Header("Camera Follow Settings")]
-        [Tooltip("Offset from the active room's center if the room has no explicit cameraAnchor assigned.")]
+        [Tooltip("Camera to move (auto-detects Main Camera if left empty).")]
+        public Camera targetCamera;
+
+        [Header("Camera Framing & Follow Settings")]
+        [Tooltip("If TRUE, uses the exact Position and Rotation of each room's CameraAnchor without overriding your angle.")]
+        public bool useExactCameraAnchorPose = true;
+
+        [Tooltip("Only used when useExactCameraAnchorPose is FALSE: how much the camera shifts/tilts toward the agent.")]
+        [Range(0f, 1f)]
+        public float agentFollowWeight = 0.0f;
+
+        [Tooltip("Fallback offset from the active room's center ONLY if the room has no CameraAnchor assigned.")]
         public Vector3 fallbackRoomCameraOffset = new Vector3(0f, 11f, -9.5f);
 
-        [Tooltip("How much the camera subtly shifts toward the Hero Agent inside the active room (0 = fixed room shot, 0.35 = gentle follow).")]
-        [Range(0f, 1f)]
-        public float agentFollowWeight = 0.25f;
+        [Tooltip("Fallback pitch angle (in degrees) ONLY if the room has no CameraAnchor assigned.")]
+        public Vector3 fallbackCameraEulerAngles = new Vector3(48f, 0f, 0f);
 
-        [Tooltip("Camera position smoothing time (lower = faster pan between rooms).")]
-        public float positionSmoothTime = 0.45f;
+        [Tooltip("Camera position smoothing time when transitioning between rooms (0 = instant snap).")]
+        public float positionSmoothTime = 0.35f;
 
-        [Tooltip("Camera rotation smoothing speed.")]
-        public float rotationLerpSpeed = 6f;
+        [Tooltip("Camera rotation smoothing speed when transitioning between rooms.")]
+        public float rotationLerpSpeed = 8f;
 
         [Header("YouTube HUD Overlay Settings")]
         public bool showHUD = true;
 
+        private Transform _camTransform;
         private Vector3 _cameraVelocity;
+        private bool _hasSnappedInitialPose = false;
+
         private GUIStyle _panelStyle;
         private GUIStyle _titleStyle;
         private GUIStyle _bodyStyle;
@@ -41,11 +53,37 @@ namespace EscapeRoomML
         private Texture2D _barFillWarnTex;
         private Texture2D _barFillDangerTex;
 
+        private void Awake()
+        {
+            ResolveCameraAndHeroArena();
+        }
+
         private void Start()
         {
-            if (heroArena == null)
+            ResolveCameraAndHeroArena();
+            SnapToActiveRoomImmediate();
+        }
+
+        private void ResolveCameraAndHeroArena()
+        {
+            // 1. Find the Camera to control (works even if this script is attached to EscapeArena instead of Main Camera!)
+            if (targetCamera == null)
             {
-                // Auto-detect Hero Arena if not manually assigned
+                if (!TryGetComponent<Camera>(out targetCamera))
+                    targetCamera = Camera.main;
+
+                if (targetCamera == null)
+                    targetCamera = FindFirstObjectByType<Camera>();
+            }
+
+            if (targetCamera != null)
+                _camTransform = targetCamera.transform;
+            else
+                _camTransform = transform;
+
+            // 2. Find the Hero Arena (preferring the one with isHeroArena == true)
+            if (heroArena == null || !heroArena.isHeroArena)
+            {
                 var arenas = FindObjectsByType<EscapeArenaManager>(FindObjectsSortMode.None);
                 foreach (var a in arenas)
                 {
@@ -62,46 +100,94 @@ namespace EscapeRoomML
 
         private void LateUpdate()
         {
-            if (heroArena == null || heroArena.CurrentRoom == null)
-                return;
+            if (heroArena == null || _camTransform == null)
+            {
+                ResolveCameraAndHeroArena();
+                if (heroArena == null || _camTransform == null)
+                    return;
+            }
 
             EscapeRoomController activeRoom = heroArena.CurrentRoom;
+            if (activeRoom == null)
+                return;
+
+            GetDesiredCameraPose(activeRoom, out Vector3 targetPos, out Quaternion targetRot);
+
+            if (!_hasSnappedInitialPose)
+            {
+                _camTransform.SetPositionAndRotation(targetPos, targetRot);
+                _cameraVelocity = Vector3.zero;
+                _hasSnappedInitialPose = true;
+                return;
+            }
+
+            if (positionSmoothTime <= 0.001f)
+            {
+                _camTransform.position = targetPos;
+            }
+            else
+            {
+                _camTransform.position = Vector3.SmoothDamp(
+                    _camTransform.position,
+                    targetPos,
+                    ref _cameraVelocity,
+                    positionSmoothTime
+                );
+            }
+
+            _camTransform.rotation = Quaternion.Slerp(
+                _camTransform.rotation,
+                targetRot,
+                rotationLerpSpeed * Time.deltaTime
+            );
+        }
+
+        private void SnapToActiveRoomImmediate()
+        {
+            if (heroArena != null && heroArena.CurrentRoom != null && _camTransform != null)
+            {
+                GetDesiredCameraPose(heroArena.CurrentRoom, out Vector3 targetPos, out Quaternion targetRot);
+                _camTransform.SetPositionAndRotation(targetPos, targetRot);
+                _cameraVelocity = Vector3.zero;
+                _hasSnappedInitialPose = true;
+            }
+        }
+
+        private void GetDesiredCameraPose(EscapeRoomController activeRoom, out Vector3 targetCamPos, out Quaternion targetCamRot)
+        {
             Vector3 roomCenter = activeRoom.transform.position;
             Vector3 agentPos = heroArena.agent != null ? heroArena.agent.transform.position : roomCenter;
 
-            Vector3 targetCamPos;
-            Quaternion targetCamRot;
-
             if (activeRoom.cameraAnchor != null)
             {
-                Vector3 blendedFocus = Vector3.Lerp(roomCenter, agentPos, agentFollowWeight);
-                targetCamPos = activeRoom.cameraAnchor.position + (blendedFocus - roomCenter) * 0.5f;
-                targetCamRot = Quaternion.LookRotation((blendedFocus - targetCamPos).normalized, Vector3.up);
+                if (useExactCameraAnchorPose || agentFollowWeight <= 0.001f)
+                {
+                    // Honor the EXACT position and rotation set on the room's CameraAnchor!
+                    targetCamPos = activeRoom.cameraAnchor.position;
+                    targetCamRot = activeRoom.cameraAnchor.rotation;
+                }
+                else
+                {
+                    Vector3 blendedFocus = Vector3.Lerp(roomCenter, agentPos, agentFollowWeight);
+                    targetCamPos = activeRoom.cameraAnchor.position + (blendedFocus - roomCenter) * 0.35f;
+                    targetCamRot = Quaternion.Slerp(
+                        activeRoom.cameraAnchor.rotation,
+                        Quaternion.LookRotation((blendedFocus - targetCamPos).normalized, Vector3.up),
+                        agentFollowWeight
+                    );
+                }
             }
             else
             {
                 Vector3 blendedFocus = Vector3.Lerp(roomCenter, agentPos, agentFollowWeight);
                 targetCamPos = blendedFocus + fallbackRoomCameraOffset;
-                targetCamRot = Quaternion.LookRotation((blendedFocus - targetCamPos).normalized, Vector3.up);
+                targetCamRot = Quaternion.Euler(fallbackCameraEulerAngles);
             }
-
-            transform.position = Vector3.SmoothDamp(
-                transform.position,
-                targetCamPos,
-                ref _cameraVelocity,
-                positionSmoothTime
-            );
-
-            transform.rotation = Quaternion.Slerp(
-                transform.rotation,
-                targetCamRot,
-                rotationLerpSpeed * Time.deltaTime
-            );
         }
 
         private void InitStyles()
         {
-            if (_panelStyle != null)
+            if (_panelStyle != null && _darkTex != null)
                 return;
 
             _darkTex = MakeSolidTexture(new Color(0.08f, 0.1f, 0.14f, 0.86f));
@@ -127,6 +213,7 @@ namespace EscapeRoomML
             {
                 fontSize = 15,
                 fontStyle = FontStyle.Normal,
+                richText = true,
                 normal = { textColor = new Color(0.88f, 0.91f, 0.96f) }
             };
 
@@ -141,12 +228,24 @@ namespace EscapeRoomML
 
         private void OnGUI()
         {
-            if (!showHUD || heroArena == null || heroArena.CurrentRoom == null)
+            if (!showHUD)
                 return;
 
             InitStyles();
 
+            if (heroArena == null)
+            {
+                GUI.Box(new Rect(24f, 24f, 520f, 50f), "HeroCameraAndHUD: No EscapeArenaManager found in Scene!", _panelStyle);
+                return;
+            }
+
             EscapeRoomController room = heroArena.CurrentRoom;
+            if (room == null)
+            {
+                GUI.Box(new Rect(24f, 24f, 560f, 50f), $"HeroCameraAndHUD: '{heroArena.name}' has no Rooms assigned in EscapeArenaManager!", _panelStyle);
+                return;
+            }
+
             int totalRooms = heroArena.rooms != null ? heroArena.rooms.Length : 3;
             int roomNum = heroArena.CurrentRoomIndex + 1;
 
@@ -160,7 +259,6 @@ namespace EscapeRoomML
 
             string doorStatus = room.IsDoorUnlocked ? "<color=#4ADE80>UNLOCKED</color>" : "<color=#F87171>LOCKED</color>";
             float puzzlePct = room.GetPuzzleProgress() * 100f;
-            _bodyStyle.richText = true;
 
             GUILayout.Label($"<b>Room Attempt:</b> #{heroArena.CurrentRoomAttempt}   |   <b>Total Runs:</b> #{heroArena.TotalAttemptsAllRooms}", _bodyStyle);
             GUILayout.Label($"<b>Puzzles Solved:</b> {puzzlePct:0}%   |   <b>Exit Door:</b> {doorStatus}", _bodyStyle);

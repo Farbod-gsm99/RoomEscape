@@ -4,7 +4,7 @@ namespace EscapeRoomML
 {
     /// <summary>
     /// Coordinates the multi-room escape sequence for a single Arena instance (Hero or Background Parallel Arena).
-    /// Manages per-room timers, checkpoint progression, door locking, and the final escape state.
+    /// Auto-discovers child EscapeRoomControllers if the Rooms array is left empty in the Inspector.
     /// </summary>
     public class EscapeArenaManager : MonoBehaviour
     {
@@ -15,7 +15,7 @@ namespace EscapeRoomML
         [Tooltip("Reference to the EscapeAgent inside this arena.")]
         public EscapeAgent agent;
 
-        [Tooltip("Ordered array of rooms (Room 1, Room 2, Room 3).")]
+        [Tooltip("Ordered array of rooms (Room 1, Room 2, Room 3). Auto-populated from child objects if left empty.")]
         public EscapeRoomController[] rooms;
 
         [Header("Progression Rules")]
@@ -24,13 +24,16 @@ namespace EscapeRoomML
 
         [Header("Rewards & Penalties")]
         [Tooltip("Reward granted when the agent passes through a room's exit door in time.")]
-        public float roomEscapeReward = 2.0f;
+        public float roomEscapeReward = 2.5f;
 
         [Tooltip("Bonus reward granted when escaping the final room.")]
         public float finalRoomBonusReward = 1.5f;
 
-        [Tooltip("Penalty applied when the room timer expires or the agent hits a hazard/pit.")]
-        public float failurePenalty = -1.0f;
+        [Tooltip("Moderate penalty when hitting a hazard or pit (kept smaller than timeoutPenalty so the agent bravely attempts obstacles).")]
+        public float hazardPenalty = -0.35f;
+
+        [Tooltip("Larger penalty applied when the room timer expires (discourages stalling/running in circles at spawn).")]
+        public float timeoutPenalty = -1.0f;
 
         // Live state exposed for the HUD and Camera
         public int CurrentRoomIndex { get; private set; } = 0;
@@ -52,24 +55,30 @@ namespace EscapeRoomML
         private void Awake()
         {
             if (agent == null)
-                agent = GetComponentInChildren<EscapeAgent>();
+                agent = GetComponentInChildren<EscapeAgent>(true);
+
+            // Auto-populate rooms in hierarchy order if left unassigned or empty in the Inspector
+            if (rooms == null || rooms.Length == 0 || rooms[0] == null)
+            {
+                rooms = GetComponentsInChildren<EscapeRoomController>(false);
+            }
 
             CurrentRoomIndex = 0;
         }
 
-        private void Update()
+        private void FixedUpdate()
         {
             if (HasHeroCompletedAllRooms)
                 return;
 
-            TotalElapsedTime += Time.deltaTime;
+            TotalElapsedTime += Time.fixedDeltaTime;
 
-            // Tick down the active room timer
-            RemainingRoomTime -= Time.deltaTime;
+            // Tick down the active room timer in FixedUpdate so it stays synced at 20x training speed
+            RemainingRoomTime -= Time.fixedDeltaTime;
             if (RemainingRoomTime <= 0f)
             {
                 RemainingRoomTime = 0f;
-                OnAgentFailed("Time Expired!");
+                OnAgentFailed("Time Expired!", isTimeout: true);
             }
         }
 
@@ -85,7 +94,7 @@ namespace EscapeRoomML
             EscapeRoomController activeRoom = CurrentRoom;
             if (activeRoom == null)
             {
-                Debug.LogError($"[EscapeArenaManager] No room assigned at index {CurrentRoomIndex} on {name}!");
+                Debug.LogError($"[EscapeArenaManager] No room found on {name}! Make sure Room objects have EscapeRoomController attached.");
                 return;
             }
 
@@ -129,7 +138,6 @@ namespace EscapeRoomML
             {
                 if (_currentRoomSolves >= requiredSolvesToAdvance)
                 {
-                    // Close the door behind the agent and advance checkpoint to the next room
                     clearedRoom.CloseAndLockDoorBehindAgent();
                     CurrentRoomIndex++;
                     _currentRoomSolves = 0;
@@ -145,12 +153,10 @@ namespace EscapeRoomML
             }
             else
             {
-                // Agent just escaped the FINAL room!
                 agent.AddReward(finalRoomBonusReward);
 
                 if (isHeroArena)
                 {
-                    // Stop the Hero Arena here for the YouTube finale!
                     HasHeroCompletedAllRooms = true;
                     LastEventMessage = "VICTORY! Hero Agent escaped all rooms!";
                     agent.EndEpisode();
@@ -158,9 +164,6 @@ namespace EscapeRoomML
                 }
                 else
                 {
-                    // Background parallel arenas stay in the final room and keep resetting it
-                    // so they continue feeding final-room training experiences to the shared brain
-                    // until the Hero Arena also escapes!
                     CurrentRoomAttempt++;
                     TotalAttemptsAllRooms++;
                     LastEventMessage = "Background Arena cleared final room (repeating final room for training).";
@@ -173,12 +176,14 @@ namespace EscapeRoomML
         /// Called when the room timer runs out or the agent touches a hazard/pit.
         /// Respawns the agent at the start of the CURRENT room (never back to Room 1).
         /// </summary>
-        public void OnAgentFailed(string reason)
+        public void OnAgentFailed(string reason, bool isTimeout = false)
         {
             if (HasHeroCompletedAllRooms)
                 return;
 
-            agent.AddReward(failurePenalty);
+            float penalty = isTimeout ? timeoutPenalty : hazardPenalty;
+            agent.AddReward(penalty);
+
             CurrentRoomAttempt++;
             TotalAttemptsAllRooms++;
             LastEventMessage = $"Room {CurrentRoomIndex + 1} Failed: {reason} (Attempt #{CurrentRoomAttempt})";
